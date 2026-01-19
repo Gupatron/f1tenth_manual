@@ -1,4 +1,4 @@
-# dshot_serial.py
+# dshot_serial.py (Fixed)
 import serial
 import struct
 
@@ -21,13 +21,16 @@ class DShotSerial:
 
     def send_motors_and_pwm(self, m_val, pwm_val):
         """
-        Sends the motor value (DShot) to all 4 motors and 
-        the steering value (PWM) to the servo.
+        Sends the motor value (throttle 0-2047) to all 4 motors and 
+        the steering value (PWM 0-1023) to the servo.
+        
+        NOTE: m_val is a THROTTLE value (0-2047), NOT a DShot command number
         """
         if not self.ser:
             return
 
         # Clamp values to safe hardware limits
+        # All motors get the same throttle value
         m1 = m2 = m3 = m4 = max(0, min(2047, int(m_val)))
         pwm = max(0, min(1023, int(pwm_val)))
 
@@ -39,10 +42,13 @@ class DShotSerial:
         self.ser.write(packet)
 
     def disarm(self):
-        """Sends the disarm signal (47) and neutral PWM."""
-        print("Sending disarm signal...")
-        for _ in range(10):
-            self.send_motors_and_pwm(47, 523) # 47 is DShot disarm/stop
+        """
+        Sends zero throttle and neutral PWM.
+        Based on working dshot_communication.py pattern.
+        """
+        print("Sending disarm signal (zero throttle)...")
+        for _ in range(50):  # 1 second at 50Hz
+            self.send_motors_and_pwm(0, 523)  # 0 = zero throttle, 523 = neutral
 
     def close(self):
         if self.ser:

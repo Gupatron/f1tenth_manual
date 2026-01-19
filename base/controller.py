@@ -3,6 +3,7 @@ import pygame
 import time
 from base_databuffer import DataBuffer
 import controller_config
+from expo import DualExpoMapper
 
 class Controller:
     def __init__(self, databuffer: DataBuffer, frequency: float = 20.0):
@@ -12,12 +13,17 @@ class Controller:
 
         # Target Ranges for the new mapping
         self.STEER_MIN, self.STEER_MAX = 120, 880
-        self.RPM_L2_MIN, self.RPM_L2_MAX = 48, 1047
-        self.RPM_R2_MIN, self.RPM_R2_MAX = 1049, 2047
+        self.RPM_L2_MIN, self.RPM_L2_MAX = 48, 300
+        self.RPM_R2_MIN, self.RPM_R2_MAX = 1049, 1300
         self.NEUTRAL_RPM = 1048
         
         self.MAX_LOOK_RATE = 180.0
         self.STICK_DEADZONE = 0.12
+
+        # Initialize expo mapping
+        # steering_expo: 0.3 for smooth, precise steering
+        # throttle_expo: 0.5 for smooth acceleration/braking
+        self.expo = DualExpoMapper(steering_expo=0.3, throttle_expo=0.5)
 
         if pygame.joystick.get_count() == 0:
             raise RuntimeError("No controller detected!")
@@ -45,14 +51,19 @@ class Controller:
             while True:
                 pygame.event.pump()
 
-                # 1. Steering Angle (120 to 880)
+                # 1. Steering Angle (120 to 880) with Expo
                 raw_steer = self.joy.get_axis(self.AX_STEER)
-                steering_angle = int(self._map(raw_steer, -1.0, 1.0, self.STEER_MIN, self.STEER_MAX))
+                expo_steer = self.expo.apply_steering(raw_steer)
+                steering_angle = int(self._map(expo_steer, -1.0, 1.0, self.STEER_MIN, self.STEER_MAX))
 
-                # 2. RPM (Triggers)
+                # 2. RPM (Triggers) with Expo
                 # Pygame triggers rest at -1.0 and go to 1.0
                 raw_l2 = self.joy.get_axis(self.AX_L2)
                 raw_r2 = self.joy.get_axis(self.AX_R2)
+                
+                # Apply expo to trigger inputs
+                expo_l2 = self.expo.apply_throttle(raw_l2)
+                expo_r2 = self.expo.apply_throttle(raw_r2)
                 
                 l2_active = raw_l2 > -0.9
                 r2_active = raw_r2 > -0.9
@@ -60,9 +71,9 @@ class Controller:
                 if l2_active and r2_active:
                     rpm = self.NEUTRAL_RPM
                 elif l2_active:
-                    rpm = int(self._map(raw_l2, -1.0, 1.0, self.RPM_L2_MIN, self.RPM_L2_MAX))
+                    rpm = int(self._map(expo_l2, -1.0, 1.0, self.RPM_L2_MIN, self.RPM_L2_MAX))
                 elif r2_active:
-                    rpm = int(self._map(raw_r2, -1.0, 1.0, self.RPM_R2_MIN, self.RPM_R2_MAX))
+                    rpm = int(self._map(expo_r2, -1.0, 1.0, self.RPM_R2_MIN, self.RPM_R2_MAX))
                 else:
                     rpm = self.NEUTRAL_RPM
 
