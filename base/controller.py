@@ -86,14 +86,15 @@ class PS4Controller(BaseController):
                 else:
                     rpm = self.NEUTRAL_RPM
 
-                self.update_buffer(rpm, steering_angle)
+                self.update_buffer(rpm, steering_angle, self.look_theta)
                 time.sleep(self.loop_period)
         except KeyboardInterrupt: pass
 
-    def update_buffer(self, rpm, steer):
+    def update_buffer(self, rpm, steer, look):
         with self.buffer.lock:
             self.buffer.Omega.append(float(rpm))
             self.buffer.Theta.append(float(steer))
+            self.buffer.look_theta.append(float(look))
 
 class WheelController(BaseController):
     def __init__(self, databuffer, frequency=20.0, device_path="/dev/input/event7"):
@@ -153,20 +154,20 @@ class WheelController(BaseController):
         # Button 5: Gear Up, Button 4: Gear Down
         if buttons[5] and not self.prev_buttons[5]:
             self.gear = min(5, self.gear + 1)
-            print(f"Gear Shifted Up: {self.gear}")
+            print(f"\nGear Shifted Up: {self.gear}")
             
         if buttons[4] and not self.prev_buttons[4]:
             self.gear = max(0, self.gear - 1)
-            print(f"Gear Shifted Down: {self.gear}")
+            print(f"\nGear Shifted Down: {self.gear}")
 
         # Button 0: Forward, Button 1: Backward
         if buttons[0] and not self.prev_buttons[0]:
             self.direction = "FORWARD"
-            print("Direction: FORWARD")
+            print("\nDirection: FORWARD")
             
         if buttons[1] and not self.prev_buttons[1]:
             self.direction = "BACKWARD"
-            print("Direction: BACKWARD")
+            print("\nDirection: BACKWARD")
         
         self.prev_buttons = buttons.copy()
 
@@ -194,15 +195,11 @@ class WheelController(BaseController):
                     # Reverse: Throttle 0 is neutral, Throttle 1.0 is max reverse (e.g., 48)
                     rpm = int(self._map(throttle_norm, 0, 1.0, self.NEUTRAL_RPM, g_min))
 
-                # 3. Write to Buffer
+                # 3. Write to Buffer (now includes look_theta)
                 with self.buffer.lock:
                     self.buffer.Omega.append(float(rpm))
                     self.buffer.Theta.append(float(steering_angle))
-
-                # 4. Live Dashboard Printout
-                # \r moves the cursor back to the start of the line
-                # \033[K clears the line to prevent ghost characters
-                print(f"\r\033[K[DRIVE] Gear: {self.gear} | Dir: {self.direction} | RPM: {rpm} | Steer: {steering_angle}", end="", flush=True)
+                    self.buffer.look_theta.append(float(self.look_theta))
                 
                 time.sleep(self.loop_period)
         except KeyboardInterrupt:
