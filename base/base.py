@@ -4,12 +4,20 @@ import zenoh
 import time
 import pygame
 from base_databuffer import DataBuffer
-from controller import Controller
+from controller import PS4Controller, WheelController  # Import both controller classes
 from base_wifi import Message, send_message, get_latest_message_from_buffer, print_latest, reply_callback
+
+# --- CONFIGURATION ---
+USE_PS4 = False  # Set to False to use the Steering Wheel + Gear Selector
+# ---------------------
 
 def controller_thread(buffer: DataBuffer):
     try:
-        controller = Controller(databuffer=buffer, frequency=20.0)
+        # Choose controller based on configuration
+        if USE_PS4:
+            controller = PS4Controller(databuffer=buffer, frequency=20.0)
+        else:
+            controller = WheelController(databuffer=buffer, frequency=20.0)
         controller.run()
     except Exception as e:
         print(f"Controller thread error: {e}")
