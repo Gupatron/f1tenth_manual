@@ -9,6 +9,7 @@ from expo import DualExpoMapper
 
 # --- CONFIGURATION ---
 USE_PS4 = False  # Set to False to use the Steering Wheel + Gear Selector
+BRAKE_MODE = "NEUTRAL"  # Options: "ACTIVE", "NEUTRAL", "PROGRESSIVE"
 # ---------------------
 
 class BaseController:
@@ -20,8 +21,12 @@ class BaseController:
         
         # Shared Target Ranges
         self.STEER_MIN, self.STEER_MAX = 120, 880
-        self.NEUTRAL_RPM = 1048
+        self.NEUTRAL_RPM = 0  # Changed back to 0
         self.MAX_LOOK_RATE = 180.0
+        
+        # Braking ranges
+        self.BRAKE_MIN = 10   # Active braking range: 1-47
+        self.BRAKE_MAX = 47
         
         self._init_pygame_headless()
 
@@ -45,17 +50,19 @@ class BaseController:
                 2: (1049, 1300),
                 3: (1049, 1450),
                 4: (1049, 1600),
-                5: (1600, 1750)
+                5: (1049, 1750)
             }
         else: # BACKWARD
+            # Range adjusted for DShot 3D mode logic
             gear_map = {
-                1: (48, 250),
-                2: (48, 400),
-                3: (48, 550),
-                4: (48, 700),
-                5: (48, 850)
+                1: (1047, 49),
+                2: (49, 1047),
+                3: (49, 1047),
+                4: (49, 1047),
+                5: (49, 1047)
             }
         return gear_map.get(gear, (self.NEUTRAL_RPM, self.NEUTRAL_RPM))
+
 
 class PS4Controller(BaseController):
     def __init__(self, databuffer, frequency=20.0):
@@ -79,16 +86,17 @@ class PS4Controller(BaseController):
                 
                 if raw_r2 > -0.9:
                     g_min, g_max = self.get_gear_limits(self.current_gear, "FORWARD")
-                    rpm = int(self._map(self.expo.apply_throttle(raw_r2), -1.0, 1.0, g_min, g_max))
+                    rpm = int(self._map(self.expo.apply_throttle(raw_r2), -1.0, 1.0, self.NEUTRAL_RPM + 1, g_max))
                 elif raw_l2 > -0.9:
-                    g_min, g_max = self.get_gear_limits(self.current_gear, "BACKWARD")
-                    rpm = int(self._map(self.expo.apply_throttle(raw_l2), 1.0, -1.0, g_max, g_min))
+                    # PS4 Reverse: Map L2 trigger to 1047 -> 49
+                    rpm = int(self._map(self.expo.apply_throttle(raw_l2), -1.0, 1.0, self.NEUTRAL_RPM - 1, 49))
                 else:
                     rpm = self.NEUTRAL_RPM
 
                 self.update_buffer(rpm, steering_angle, self.look_theta)
                 time.sleep(self.loop_period)
-        except KeyboardInterrupt: pass
+        except KeyboardInterrupt: 
+            pass
 
     def update_buffer(self, rpm, steer, look):
         with self.buffer.lock:
@@ -96,31 +104,21 @@ class PS4Controller(BaseController):
             self.buffer.Theta.append(float(steer))
             self.buffer.look_theta.append(float(look))
 
+
 class WheelController(BaseController):
-    def __init__(self, databuffer, frequency=20.0, device_path="/dev/input/event7"):
+    def __init__(self, databuffer, frequency=20.0, device_path=None):
         super().__init__(databuffer, frequency)
         
-        # 1. Initialize Pygame for Buttons
         if pygame.joystick.get_count() == 0:
-            raise RuntimeError("No controller detected by Pygame! Check USB connection.")
+            raise RuntimeError("No controller detected by Pygame!")
         
         self.joy = pygame.joystick.Joystick(0)
         self.joy.init()
-        print(f"[Pygame] Linked to: {self.joy.get_name()}") # Verify this is the wheel
 
-        # 2. Initialize Evdev for Axes
-        try:
-            self.wheel_dev = InputDevice(device_path)
-            print(f"[Evdev] Linked to: {self.wheel_dev.name} at {device_path}")
-        except PermissionError:
-            print("\n!!! PERMISSION DENIED: Try running with 'sudo python3 controller.py' !!!\n")
-            raise
-        except Exception as e:
-            print(f"Could not open {device_path}: {e}")
-            print("Available devices:")
-            devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
-            for d in devices: print(f"  {d.path} - {d.name}")
-            raise
+        if device_path is None:
+            device_path = self._find_wheel_device()
+        
+        self.wheel_dev = InputDevice(device_path)
 
         # Logic States
         self.gear = 0
@@ -128,74 +126,142 @@ class WheelController(BaseController):
         self.prev_buttons = [0] * self.joy.get_numbuttons()
         self.raw_steer = 32768
         self.raw_throttle = 0
+        self.raw_brake = 0  # New: Brake pedal input
+        self.reverse_pedal_pressed = False
+        self.last_rpm = self.NEUTRAL_RPM  # Track last RPM for progressive braking
+
+    def _find_wheel_device(self):
+        """Auto-detect the steering wheel device."""
+        devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
+        for device in devices:
+            caps = device.capabilities(verbose=False)
+            if ecodes.EV_ABS in caps:
+                abs_events = caps[ecodes.EV_ABS]
+                if any(event[0] == ecodes.ABS_Z for event in abs_events):
+                    return device.path
+        raise RuntimeError("Could not find steering wheel device.")
 
     def poll_wheel(self):
-        """Non-blocking read of evdev events."""
         try:
-            # We must exhaust the event queue each loop
             while True:
                 event = self.wheel_dev.read_one()
-                if event is None: break 
-                
+                if event is None: 
+                    break 
                 if event.type == ecodes.EV_ABS:
-                    # Map axes based on your steeringwheelread.py logic
                     if event.code == 2:   # ABS_Z: Steering
                         self.raw_steer = event.value
                     elif event.code == 5: # ABS_RZ: Throttle
                         self.raw_throttle = event.value
+                    elif event.code == 4: # ABS_Y: Brake (adjust code if needed)
+                        self.raw_brake = event.value
         except Exception as e:
             print(f"Error reading wheel axes: {e}")
 
     def update_gears(self):
-        """Edge-triggered gear logic from gearselector.py"""
+        """Edge-triggered gear logic with direction-change safety."""
         pygame.event.pump()
         buttons = [self.joy.get_button(i) for i in range(self.joy.get_numbuttons())]
         
-        # Button 5: Gear Up, Button 4: Gear Down
+        # Gear Shift
         if buttons[5] and not self.prev_buttons[5]:
             self.gear = min(5, self.gear + 1)
-            print(f"\nGear Shifted Up: {self.gear}")
-            
         if buttons[4] and not self.prev_buttons[4]:
             self.gear = max(0, self.gear - 1)
-            print(f"\nGear Shifted Down: {self.gear}")
 
-        # Button 0: Forward, Button 1: Backward
+        # Direction Selection
+        new_direction = self.direction
         if buttons[0] and not self.prev_buttons[0]:
-            self.direction = "FORWARD"
-            print("\nDirection: FORWARD")
-            
+            new_direction = "FORWARD"
         if buttons[1] and not self.prev_buttons[1]:
-            self.direction = "BACKWARD"
-            print("\nDirection: BACKWARD")
-        
+            new_direction = "BACKWARD"
+
+        # Handle direction change
+        if new_direction != self.direction:
+            self.direction = new_direction
+            if self.direction == "BACKWARD":
+                # Reset reverse pedal flag when entering reverse
+                self.reverse_pedal_pressed = False
+                # Send 0 signal on entering reverse
+                with self.buffer.lock:
+                    self.buffer.Omega.append(0.0)
+            else:
+                # Send neutral when switching to forward
+                with self.buffer.lock:
+                    self.buffer.Omega.append(float(self.NEUTRAL_RPM))
+
         self.prev_buttons = buttons.copy()
+
+    def calculate_brake_rpm(self, brake_norm):
+        """Calculate RPM based on brake input and selected brake mode."""
+        if BRAKE_MODE == "ACTIVE":
+            # Active braking: 1-47 range (ESC must support this)
+            return int(self._map(brake_norm, 0, 1.0, self.BRAKE_MIN, self.BRAKE_MAX))
+        
+        elif BRAKE_MODE == "NEUTRAL":
+            # Simple: Just return 0 to stop
+            return 0
+        
+        elif BRAKE_MODE == "PROGRESSIVE":
+            # Progressive: Apply opposite throttle based on brake pressure
+            if self.direction == "FORWARD":
+                # Apply reverse throttle to brake
+                return int(self._map(brake_norm, 0, 1.0, 0, 200))
+            else:
+                # Apply forward throttle to brake
+                return int(self._map(brake_norm, 0, 1.0, 0, 1200))
+        
+        return 0
 
     def run(self):
         try:
             print(f"Wheel Controller Started. Device: {self.wheel_dev.name}")
+            print(f"Brake Mode: {BRAKE_MODE}")
             while True:
                 self.poll_wheel()
                 self.update_gears()
 
-                # 1. Map Steering (0-65535 -> 120-880)
+                # 1. Map Steering
                 normalized_steer = (self.raw_steer / 32767.5) - 1.0
                 expo_steer = self.expo.apply_steering(normalized_steer)
                 steering_angle = int(self._map(expo_steer, -1.0, 1.0, self.STEER_MIN, self.STEER_MAX))
 
-                # 2. Map RPM based on Gear/Direction
-                g_min, g_max = self.get_gear_limits(self.gear, self.direction)
-                
-                # Normalize throttle (assumed 0-1023)
-                throttle_norm = min(self.raw_throttle / 1023.0, 1.0)
-                
-                if self.direction == "FORWARD":
-                    rpm = int(self._map(throttle_norm, 0, 1.0, g_min, g_max))
-                else:
-                    # Reverse: Throttle 0 is neutral, Throttle 1.0 is max reverse (e.g., 48)
-                    rpm = int(self._map(throttle_norm, 0, 1.0, self.NEUTRAL_RPM, g_min))
+                # 2. Check Brake Input
+                brake_norm = min(self.raw_brake / 1023.0, 1.0)
+                brake_active = brake_norm > 0.05  # Brake threshold
 
-                # 3. Write to Buffer (now includes look_theta)
+                # 3. Map RPM
+                if brake_active:
+                    # Brake is pressed - override throttle
+                    rpm = self.calculate_brake_rpm(brake_norm)
+                else:
+                    # Normal throttle control
+                    g_min, g_max = self.get_gear_limits(self.gear, self.direction)
+                    throttle_norm = min(self.raw_throttle / 1023.0, 1.0)
+                    
+                    if self.gear == 0 or throttle_norm < 0.02:
+                        rpm = 0  # Send 0 when no throttle
+                    else:
+                        if self.direction == "FORWARD":
+                            # Forward: 1049 up to Gear Max
+                            rpm = int(self._map(throttle_norm, 0, 1.0, 1049, g_max))
+                        else:
+                            # Reverse: Send 0 until pedal is pressed, then map 49-1047
+                            if not self.reverse_pedal_pressed:
+                                if throttle_norm >= 0.02:
+                                    self.reverse_pedal_pressed = True
+                                    rpm = int(self._map(throttle_norm, 0, 1.0, 49, 1047))
+                                else:
+                                    rpm = 0
+                            else:
+                                if throttle_norm >= 0.02:
+                                    rpm = int(self._map(throttle_norm, 0, 1.0, 49, 1047))
+                                else:
+                                    rpm = 0  # Send 0 when pedal released
+
+                # Store last RPM for reference
+                self.last_rpm = rpm
+
+                # 4. Write to Buffer
                 with self.buffer.lock:
                     self.buffer.Omega.append(float(rpm))
                     self.buffer.Theta.append(float(steering_angle))
@@ -204,14 +270,3 @@ class WheelController(BaseController):
                 time.sleep(self.loop_period)
         except KeyboardInterrupt:
             print("\nShutting down controller...")
-
-if __name__ == "__main__":
-    from base_databuffer import DataBuffer
-    db = DataBuffer()
-    
-    # Selection based on top-level flag
-    if USE_PS4:
-        ctrl = PS4Controller(db)
-    else:
-        ctrl = WheelController(db)
-    ctrl.run()
